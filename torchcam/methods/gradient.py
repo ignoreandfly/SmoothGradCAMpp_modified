@@ -11,7 +11,7 @@ from torch import Tensor, nn
 
 from .core import _CAM
 
-__all__ = ["GradCAM", "GradCAMpp", "LayerCAM", "SmoothGradCAMpp", "XGradCAM"]
+__all__ = ["GradCAM", "GradCAMpp", "LayerCAM", "SmoothGradCAMpp", "XGradCAM", "SmoothGradCAMpp_modified"]
 
 
 class _GradCAM(_CAM):
@@ -405,3 +405,87 @@ class LayerCAM(_GradCAM):
     def _scale_cams(cams: List[Tensor], gamma: float = 2.0) -> List[Tensor]:
         # cf. Equation 9 in the paper
         return [torch.tanh(gamma * cam) for cam in cams]
+
+
+class SmoothGradCAMpp_modified(_GradCAM):
+    def __init__(
+        self,
+        model: nn.Module,
+        target_layer: Optional[Union[Union[nn.Module, str], List[Union[nn.Module, str]]]] = None,
+        num_samples: int = 4,
+        std: float = 0.3,
+        input_shape: Tuple[int, ...] = (3, 224, 224),
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(model, target_layer, input_shape, **kwargs)
+        # Model scores is not used by the extractor
+        self._score_used = False
+        # Input hook
+        self.hook_handles.append(model.register_forward_pre_hook(self._store_input))  # type: ignore[arg-type]
+        # Noise distribution
+        self.num_samples = num_samples
+        self.std = std
+        self._distrib = torch.distributions.normal.Normal(0, self.std)
+        # Specific input hook updater
+        self._ihook_enabled = True
+
+    def _store_input(self, _: nn.Module, _input: Tensor) -> None:
+        """Store model input tensor."""
+        if self._ihook_enabled:
+            self._input = _input[0].data.clone()
+
+    def _get_weights(
+        self,
+        class_idx: Union[int, List[int]],
+        _: Union[Tensor, None] = None,
+        eps: float = 1e-8,
+        **kwargs: Any,
+    ) -> List[Tensor]:
+        """Computes the weight coefficients of the hooked activation maps."""
+        self._input.requires_grad_(True)
+        self.out_wo_noise = self.model(self._input)
+        # Disable input update
+        self._ihook_enabled = False
+        # Keep initial activation
+        self.hook_a: List[Tensor]  # type: ignore[assignment]
+        self.hook_g: List[Tensor]  # type: ignore[assignment]
+        init_fmap = [act.clone() for act in self.hook_a]
+
+        # Initialize our gradient estimates
+        grad_2 = [torch.zeros_like(act) for act in self.hook_a]
+        grad_3 = [torch.zeros_like(act) for act in self.hook_a]
+
+        # Perform the operations N times
+        for _idx in range(self.num_samples):
+            # Add noise
+            noisy_input = self._input + self._distrib.sample(self._input.size()).to(device=self._input.device)
+            noisy_input.requires_grad_(True)
+            # Forward & Backward
+            out = self.model(noisy_input)
+            self.model.zero_grad()
+            self._backprop(out, class_idx, **kwargs)
+            grad_weight = torch.linalg.matrix_norm(self.out_wo_noise-out, ord = 2)
+
+            # Sum partial derivatives
+            grad_2 = [g2.add_(grad.pow(2)*grad_weight) for g2, grad in zip(grad_2, self.hook_g)]
+            grad_3 = [g3.add_(grad.pow(3)*grad_weight) for g3, grad in zip(grad_3, self.hook_g)]
+
+        # Reenable input update
+        self._ihook_enabled = True
+
+        # Average the gradient estimates
+        grad_2 = [g2.div_(self.num_samples) for g2 in grad_2]
+        grad_3 = [g3.div_(self.num_samples) for g3 in grad_3]
+
+        # Alpha coefficient for each pixel
+        spatial_dims = self.hook_a[0].ndim - 2
+        alpha = [
+            g2 / (2 * g2 + (g3 * act).flatten(2).sum(-1)[(...,) + (None,) * spatial_dims] + eps)
+            for g2, g3, act in zip(grad_2, grad_3, init_fmap)
+        ]
+
+        # Apply pixel coefficient in each weight
+        return [a.mul_(torch.relu(grad)).flatten(2).sum(-1) for a, grad in zip(alpha, self.hook_g)]
+
+    def extra_repr(self) -> str:
+        return f"target_layer={self.target_names}, num_samples={self.num_samples}, std={self.std}"
